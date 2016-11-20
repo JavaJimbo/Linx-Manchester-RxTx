@@ -4,33 +4,37 @@
  * 
  * 11-18-2016: Got transmitting and receiving working beautifully 
  * with Manchester coding on Parallax Linx 413 Mhz boards.
- * 11-19-2016: 
+ * 11-19-2016: Uses all START pulses
+ * 11-20-2016: Added LINXUART to receive RS232 data from magic wands at 9600 baud
  *********************************************************************************************/
+
+#include <plib.h>
+#include <string.h>
+#include <ctype.h>
 
 #define true TRUE
 #define false FALSE
 
-// #define TRANSMITTER
+//#define TRANSMITTER
+//#define RECEIVER
+#define LINXUART
+
 #define START_TRANSMIT 1
-#define RECEIVER
 
 #define TRIG_OUT LATBbits.LATB15
 #define TRIG_BIT BIT_15
 #define NUM_DATA_BITS 16
 
-#ifdef TRANSMITTER
 #define TX_OUT LATDbits.LATD3 // PORTDbits.RD3
 #define TX_PIN BIT_3
-#endif
 
-#ifdef RECEIVER
-// #define RX_IN PORTBbits.RB0
 #define RX_IN PORTReadBits(IOPORT_B, BIT_0)
-#endif
 
-#define LINXuart UART1
+#define UART_TIMEOUT 400
+#define LINXuart UART4
+#define LINXbits U4STAbits
+#define LINX_VECTOR _UART_4_VECTOR 
 
-#include <plib.h>
 
 
 #pragma config UPLLEN   = ON            // USB PLL Enabled
@@ -62,9 +66,18 @@
 unsigned char HOSTTxBuffer[MAXBUFFER];
 unsigned char HOSTRxBuffer[MAXBUFFER];
 unsigned short HOSTTxLength;
-unsigned short HOSTRxLength;
+unsigned short HOSTRxLength = 0;
 unsigned long dataInInteger;
 
+unsigned char LINXRxBuffer[MAXBUFFER] = {'\0'};
+unsigned short LINXRxIndex = 0;
+unsigned short UARTtimeout = 0;
+unsigned short LINXRxLength = 0;
+unsigned char STARTflag = FALSE;
+unsigned char INTflag = FALSE;
+unsigned short FERRcounter = 0;
+unsigned short OERRcounter = 0;
+unsigned short INTcounter = 0;
 #define MAXPOTS 4
 
 unsigned char command = 0;
@@ -77,8 +90,9 @@ unsigned long getOutData(unsigned long dataOut);
 unsigned char getDataByte(unsigned long dataInInteger);
 static void InitializeSystem(void);
 void ProcessIO(void);
-
 void ConfigAd(void);
+
+unsigned short arrTimer2[4];
 
 // #define FILENAME "CUES.txt"
 static const char FILENAME[] = "CUES.txt";
@@ -89,6 +103,11 @@ unsigned long dataOutInt = 0;
 #ifdef RECEIVER
 unsigned char RXstate = 0, previousRXstate = 0;
 unsigned char dataReady = FALSE;
+#endif
+
+#ifdef LINXUART
+unsigned char RXstate = 0;
+unsigned short charCounter = 0;
 #endif
 
 unsigned char getDataByte(unsigned long dataInInteger) {
@@ -122,7 +141,6 @@ unsigned short getDataInteger(unsigned long dataInInteger) {
 }
 
 #define XORmask 0xAAAAAAAA
-
 unsigned long getOutData(unsigned long dataOut) {
     unsigned long dataInt, intMask, xorInt;
     unsigned long i, dataMask;
@@ -144,6 +162,7 @@ int main(void) {
     unsigned short dataOut = 0;
     unsigned short command = 0;
     unsigned short check = 0;
+    unsigned short receiveCounter = 0;
     short i;
 
     InitializeSystem();
@@ -163,8 +182,24 @@ int main(void) {
     dataOut = 0;
 #endif    
 
+#ifdef LINXUART
+    printf("\rTESTING LINX UART AT 9600 BAUD");
+#endif    
     dataOut = 0xFF00;
     while (1) {
+#ifdef LINXUART
+        if (LINXRxLength) {            
+            printf("\r#%d: %s", receiveCounter++, LINXRxBuffer);
+            LINXRxLength = 0;
+        }
+        /*
+        if (STARTflag) {
+            STARTflag = FALSE;
+            printf("\rSTART: %d, %d, %d, %d", arrTimer2[0], arrTimer2[1], arrTimer2[2], arrTimer2[3]);
+            printf("\rINTS: %d, %d, %d", INTcounter, OERRcounter, FERRcounter);
+        }        
+        */
+#endif
 #ifdef TRANSMITTER                
         if (!TXstate) {
             DelayMs(100);
@@ -229,9 +264,7 @@ static void InitializeSystem(void) {
     TX_OUT = 1;
 #endif    
 
-#ifdef RECEIVER
     PORTSetPinsDigitalIn(IOPORT_B, BIT_0);
-#endif    
 
     PORTSetPinsDigitalOut(IOPORT_B, BIT_15);
 
@@ -269,14 +302,18 @@ static void InitializeSystem(void) {
     INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
     // INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);        
 
-    /*
+#ifdef LINXUART      
     // Set up LINX UART
-    UARTConfigure(LINXuart, UART_ENABLE_PINS_TX_RX_ONLY);    
+    UARTConfigure(LINXuart, UART_ENABLE_PINS_TX_RX_ONLY);
     UARTSetLineControl(LINXuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
     UARTSetDataRate(LINXuart, SYS_FREQ, 9600);
-    // UARTEnable(LINXuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
-    UARTEnable(LINXuart, UART_DISABLE);
-     */
+    UARTEnable(LINXuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
+
+    INTEnable(INT_U1TX, INT_DISABLED);
+    INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);
+    INTSetVectorPriority(INT_VECTOR_UART(LINXuart), INT_PRIORITY_LEVEL_2);
+    // INTSetVectorSubPriority(INT_VECTOR_UART(LINXuart), INT_SUB_PRIORITY_LEVEL_0);            
+#endif
 
     // Turn on the interrupts
     INTEnableSystemMultiVectoredInt();
@@ -309,7 +346,6 @@ void __ISR(HOST_VECTOR, ipl2) IntHostUartHandler(void) {
                     HOSTRxIndex = 0;
                 }
             }
-            // UARTtimeout=UART_TIMEOUT;
         }
     }
     if (INTGetFlag(INT_SOURCE_UART_TX(HOSTuart))) {
@@ -331,6 +367,39 @@ void __ISR(HOST_VECTOR, ipl2) IntHostUartHandler(void) {
                 INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
             }
         } else INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
+    }
+}
+
+void __ISR(LINX_VECTOR, ipl2) IntLinxUartHandler(void) {    
+unsigned char ch;
+    INTcounter++;
+    if (LINXbits.OERR || LINXbits.FERR) {
+        if (LINXbits.FERR) FERRcounter++;
+        if (LINXbits.OERR) OERRcounter++;
+        if (UARTReceivedDataIsAvailable(LINXuart))
+            ch = UARTGetDataByte(LINXuart);
+        LINXbits.OERR = 0;
+        LINXRxIndex = 0;        
+    } else if (INTGetFlag(INT_SOURCE_UART_RX(LINXuart))) {
+        INTClearFlag(INT_SOURCE_UART_RX(LINXuart));
+        if (UARTReceivedDataIsAvailable(LINXuart)) {
+            ch = UARTGetDataByte(LINXuart);
+            if (ch == '>') LINXRxIndex = 0;
+            if (LINXRxIndex < MAXBUFFER - 2 && isalpha(ch))
+                LINXRxBuffer[LINXRxIndex++] = ch;            
+            UARTtimeout = UART_TIMEOUT;            
+            if (ch == '<') {
+                LINXRxBuffer[LINXRxIndex++] = '\0';
+                LINXRxLength = LINXRxIndex;
+                LINXRxIndex = 0;
+                UARTtimeout = 0;
+                // INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);                
+            }                            
+        }
+    }
+
+    if (INTGetFlag(INT_SOURCE_UART_TX(LINXuart))) {
+        INTClearFlag(INT_SOURCE_UART_TX(LINXuart));
     }
 }
 
@@ -422,14 +491,15 @@ void __ISR(_ADC_VECTOR, ipl6) AdcHandler(void) {
 
 }
 
-#define ERROR_COUNTS 20
-#define BIT_ERROR_COUNTS 6
+#define ERROR_COUNTS 10  // was 10
+#define BIT_ERROR_COUNTS 6 // was 3
 #define START_ONE 200
-#define START_TWO 60  // was 60
-#define START_THREE 60 // was 60
+#define START_TWO 60  
+#define START_THREE 60 
+#define START_FOUR 90
 #define BITPERIOD 10
 #define TIMEOUT 30
-#define NUM_SETTLING_PULSES 3 // was 8
+#define NUM_SETTLING_PULSES 3 
 
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     static unsigned short Timer2Counter = 0;
@@ -437,23 +507,89 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     static unsigned int PreviousPINstate = 0;
     static unsigned long dataInt = 0x0000;
     static unsigned char pulseCounter = 0;
+    unsigned char ch;
 #ifdef TRANSMITTER    
     static unsigned char bitCounter = 0;
 #endif
 
     mT2ClearIntFlag(); // clear the interrupt flag    
 
-#ifdef RECEIVER
+#ifdef LINXUART    
+    if (UARTtimeout) {
+        UARTtimeout--;
+        if (!UARTtimeout) {
+            RXstate = 0;
+            LINXRxIndex = 0;
+            INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);
+        }
+    }    
     Timer2Counter++;
     if (RX_IN != PreviousPINstate) {
         PreviousPINstate = RX_IN;
-        if (!RXstate) {
+        if (RXstate == 0) {
             if (RX_IN == 1) {
                 RXstate++;
                 Timer2Counter = 0x00;
                 dataOutMask = 0x0001;
                 dataInt = 0x0000;
+            } 
+        } else if (RXstate == 1) {
+            if (RX_IN == 0) {
+                if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {
+                    RXstate++;
+                    arrTimer2[0] = Timer2Counter;
+                    Timer2Counter = 0x00;
+                } else RXstate = 0;
             } else RXstate = 0;
+        } else if (RXstate == 2) {
+            if (RX_IN == 1) {
+                if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {                    
+                    RXstate++;
+                    arrTimer2[1] = Timer2Counter;
+                    Timer2Counter = 0x00;
+                } else RXstate = 0;
+            } else RXstate = 0;        
+        } else if (RXstate == 3) {
+            if (RX_IN == 0) {
+                if (Timer2Counter > (START_THREE - ERROR_COUNTS) && Timer2Counter < (START_THREE + ERROR_COUNTS)) {
+                    RXstate++;
+                    arrTimer2[2] = Timer2Counter;
+                    Timer2Counter = 0x00;
+                } else RXstate = 0;
+            } else RXstate = 0;                       
+        } else if (RXstate == 4) {
+            if (RX_IN == 1) {
+                if (Timer2Counter > (START_FOUR - ERROR_COUNTS) && Timer2Counter < (START_FOUR * 2)) {
+                    RXstate++;
+                    arrTimer2[3] = Timer2Counter;
+                    Timer2Counter = 0x00;
+                    STARTflag = TRUE;                    
+                    while (LINXbits.OERR || LINXbits.FERR) {
+                        if (LINXbits.FERR) FERRcounter++;
+                        if (LINXbits.OERR) OERRcounter++;
+                        if (UARTReceivedDataIsAvailable(LINXuart))
+                        ch = UARTGetDataByte(LINXuart);
+                        LINXbits.OERR = 0;
+                    }                                           
+                    INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_ENABLED);
+                    UARTtimeout = UART_TIMEOUT;
+                } else RXstate = 0;
+            } else RXstate = 0;
+        }                 
+    }
+#endif
+
+#ifdef RECEIVER
+    Timer2Counter++;
+    if (RX_IN != PreviousPINstate) {
+        PreviousPINstate = RX_IN;
+        if (RXstate == 0) {
+            if (RX_IN == 1) {
+                RXstate++;
+                Timer2Counter = 0x00;
+                dataOutMask = 0x0001;
+                dataInt = 0x0000;
+            } 
         } else if (RXstate == 1) {
             if (RX_IN == 0) {
                 if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {
@@ -466,40 +602,22 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
                 if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {
                     RXstate++;
                     Timer2Counter = 0x00;
-                } else {
-                    RXstate = 0;
-                    // error = 1;
-                }
-            } else {
-                RXstate = 0;
-                error = 2;
-            }
+                } else RXstate = 0;
+            } else RXstate = 0;
         } else if (RXstate == 3) {
             if (RX_IN == 0) {
                 if (Timer2Counter > (START_THREE - ERROR_COUNTS) && Timer2Counter < (START_THREE + ERROR_COUNTS)) {
                     RXstate++;
                     Timer2Counter = 0x00;
-                } else {
-                    RXstate = 0;
-                    error = 3;
-                }
-            } else {
-                RXstate = 0;
-                error = 4;
-            }
+                    STARTflag = TRUE;
+                } else RXstate = 0;
+            } else RXstate = 0;
         } else if (RXstate == 4) {
             if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
                 Timer2Counter = 0x00;
                 if (RX_IN) RXstate++;
-                else {
-                    RXstate = 0;
-                    error = 5;
-                }
-            } else {
-                RXstate = 0;
-                if (Timer2Counter <= (BITPERIOD - BIT_ERROR_COUNTS)) error = 6;
-                else error = 7;
-            }
+                else RXstate = 0;
+            } else RXstate = 0;
         } else {
             if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
                 Timer2Counter = 0x00;
@@ -513,16 +631,13 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
                     dataInt = dataInt | dataOutMask;
                     dataOutMask = dataOutMask << 1;
                 } else dataOutMask = dataOutMask << 2;
-            } else {
-                RXstate = 0;
-                error = 8;
-            }
-        }        
+            } else RXstate = 0;
+        }
     } else if (Timer2Counter > TIMEOUT && RXstate == 5) {
         dataReady = TRUE;
         dataInInteger = dataInt;
         RXstate = 0;
-    }     
+    }
 #endif    
 
 #ifdef TRANSMITTER     
