@@ -6,6 +6,7 @@
  * with Manchester coding on Parallax Linx 413 Mhz boards.
  * 11-19-2016: Uses all START pulses
  * 11-20-2016: Added LINXUART to receive RS232 data from magic wands at 9600 baud
+ * 11-26-2016: Fixed problem in RECEIVER interrupt for much smoother operation with fewer errors.
  *********************************************************************************************/
 
 #include <plib.h>
@@ -15,12 +16,13 @@
 #define true TRUE
 #define false FALSE
 
-//#define TRANSMITTER
-//#define RECEIVER
-#define LINXUART
+// #define TRANSMITTER
+#define RECEIVER
+// #define LINXUART
 
 #define START_TRANSMIT 1
 
+#define TEST_OUT LATBbits.LATB1
 #define TRIG_OUT LATBbits.LATB15
 #define TRIG_BIT BIT_15
 #define NUM_DATA_BITS 16
@@ -222,7 +224,7 @@ int main(void) {
             else printf("\rERROR: %x != %x", check, command);
         } else if (error) {
             printf("\rError: %d", error);
-            error = 0;
+            error = 0;            
         }
 #endif        
 
@@ -266,7 +268,7 @@ static void InitializeSystem(void) {
 
     PORTSetPinsDigitalIn(IOPORT_B, BIT_0);
 
-    PORTSetPinsDigitalOut(IOPORT_B, BIT_15);
+    PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1);
 
 
     PORTSetPinsDigitalOut(IOPORT_C, BIT_3 | BIT_13 | BIT_14 | BIT_4);
@@ -280,12 +282,21 @@ static void InitializeSystem(void) {
     T2CONbits.TCKPS1 = 1;
     T2CONbits.TCKPS0 = 1;
     T2CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
-    PR2 = 100;
+    PR2 = 100;    // Was 100
     T2CONbits.TON = 1; // Let her rip
     // OpenTimer2(T2_ON | T2_SOURCE_INT | T2_PS_1_256, 5208); For 60 frames/sec 
 
     // set up the core timer interrupt with a priority of 5 and zero sub-priority
     ConfigIntTimer2(T2_INT_ON | T2_INT_PRIOR_5);
+    
+    
+    // Set up Timer 3 as a counter
+    T3CON = 0x00;
+    T3CONbits.TCS = 1;     // Use counter input    
+    T3CONbits.TCKPS2 = 0; // 1:1 Prescaler
+    T3CONbits.TCKPS1 = 0;
+    T3CONbits.TCKPS0 = 0;    
+    T3CONbits.TON = 1; // Let her rip    
 
     // Set up main UART
     UARTConfigure(HOSTuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
@@ -491,10 +502,10 @@ void __ISR(_ADC_VECTOR, ipl6) AdcHandler(void) {
 
 }
 
-#define ERROR_COUNTS 10  // was 10
-#define BIT_ERROR_COUNTS 6 // was 3
-#define START_ONE 200
-#define START_TWO 60  
+#define ERROR_COUNTS 10
+#define BIT_ERROR_COUNTS 6
+#define START_ONE 300 // was 200
+#define START_TWO 60
 #define START_THREE 60 
 #define START_FOUR 90
 #define BITPERIOD 10
@@ -502,7 +513,7 @@ void __ISR(_ADC_VECTOR, ipl6) AdcHandler(void) {
 #define NUM_SETTLING_PULSES 3 
 
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
-    static unsigned short Timer2Counter = 0;
+    static unsigned short Timer2Counter = 0;    
     static unsigned long dataOutMask = 0x0001;
     static unsigned int PreviousPINstate = 0;
     static unsigned long dataInt = 0x0000;
@@ -512,6 +523,9 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     static unsigned char bitCounter = 0;
 #endif
 
+    if (TEST_OUT) TEST_OUT = 0;
+    else TEST_OUT = 1;
+    
     mT2ClearIntFlag(); // clear the interrupt flag    
 
 #ifdef LINXUART    
@@ -579,27 +593,27 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     }
 #endif
 
-#ifdef RECEIVER
-    Timer2Counter++;
-    if (RX_IN != PreviousPINstate) {
-        PreviousPINstate = RX_IN;
-        if (RXstate == 0) {
+#ifdef RECEIVER        
+    Timer2Counter++; 
+    if (RX_IN != PreviousPINstate) {        
+        PreviousPINstate = RX_IN;        
+        if (RXstate == 0) {                        
             if (RX_IN == 1) {
                 RXstate++;
                 Timer2Counter = 0x00;
                 dataOutMask = 0x0001;
-                dataInt = 0x0000;
+                dataInt = 0x0000;                                
             } 
         } else if (RXstate == 1) {
             if (RX_IN == 0) {
-                if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {
+                if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {                
                     RXstate++;
                     Timer2Counter = 0x00;
                 } else RXstate = 0;
-            } else RXstate = 0;
+            }
         } else if (RXstate == 2) {
             if (RX_IN == 1) {
-                if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {
+                if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {                    
                     RXstate++;
                     Timer2Counter = 0x00;
                 } else RXstate = 0;
@@ -619,7 +633,8 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
                 else RXstate = 0;
             } else RXstate = 0;
         } else {
-            if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
+            // if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
+            if (Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
                 Timer2Counter = 0x00;
                 if (RX_IN) dataInt = dataInt | dataOutMask;
                 dataOutMask = dataOutMask << 1;
@@ -637,7 +652,7 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
         dataReady = TRUE;
         dataInInteger = dataInt;
         RXstate = 0;
-    }
+    }            
 #endif    
 
 #ifdef TRANSMITTER     
