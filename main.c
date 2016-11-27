@@ -7,6 +7,8 @@
  * 11-19-2016: Uses all START pulses
  * 11-20-2016: Added LINXUART to receive RS232 data from magic wands at 9600 baud
  * 11-26-2016: Fixed problem in RECEIVER interrupt for much smoother operation with fewer errors.
+ * 11-27-16: Simplified Manchester transmitting / receiving and greatly improved reliability.
+ *              Transmit errors rarely occur. Distance improved significantly. 
  *********************************************************************************************/
 
 #include <plib.h>
@@ -16,16 +18,34 @@
 #define true TRUE
 #define false FALSE
 
+
+#define MAXBITLENGTH 20
+// #define ERROR_COUNTS 10
+// #define BIT_ERROR_COUNTS 6
+// #define START_ONE 300 
+#define START_ONE 290 
+// #define START_TWO 60
+#define START_TWO 50
+// #define START_THREE 60 
+#define START_THREE 50 
+// #define START_FOUR 40
+#define START_FOUR 30
+// #define BITPERIOD 10
+#define TIMEOUT 500
+#define NUM_SETTLING_PULSES 3 
+
+
+
 // #define TRANSMITTER
 #define RECEIVER
-// #define LINXUART
 
 #define START_TRANSMIT 1
 
 #define TEST_OUT LATBbits.LATB1
 #define TRIG_OUT LATBbits.LATB15
+#define PULSE_OUT LATBbits.LATB2
 #define TRIG_BIT BIT_15
-#define NUM_DATA_BITS 16
+#define NUM_DATA_BITS 8
 
 #define TX_OUT LATDbits.LATD3 // PORTDbits.RD3
 #define TX_PIN BIT_3
@@ -33,9 +53,6 @@
 #define RX_IN PORTReadBits(IOPORT_B, BIT_0)
 
 #define UART_TIMEOUT 400
-#define LINXuart UART4
-#define LINXbits U4STAbits
-#define LINX_VECTOR _UART_4_VECTOR 
 
 
 
@@ -70,12 +87,9 @@ unsigned char HOSTRxBuffer[MAXBUFFER];
 unsigned short HOSTTxLength;
 unsigned short HOSTRxLength = 0;
 unsigned long dataInInteger;
+unsigned short bitCountCheck = 0;
 
-unsigned char LINXRxBuffer[MAXBUFFER] = {'\0'};
-unsigned short LINXRxIndex = 0;
 unsigned short UARTtimeout = 0;
-unsigned short LINXRxLength = 0;
-unsigned char STARTflag = FALSE;
 unsigned char INTflag = FALSE;
 unsigned short FERRcounter = 0;
 unsigned short OERRcounter = 0;
@@ -94,8 +108,6 @@ static void InitializeSystem(void);
 void ProcessIO(void);
 void ConfigAd(void);
 
-unsigned short arrTimer2[4];
-
 // #define FILENAME "CUES.txt"
 static const char FILENAME[] = "CUES.txt";
 #ifdef TRANSMITTER
@@ -105,70 +117,16 @@ unsigned long dataOutInt = 0;
 #ifdef RECEIVER
 unsigned char RXstate = 0, previousRXstate = 0;
 unsigned char dataReady = FALSE;
+unsigned short RXdataIn = 0x0000;
 #endif
-
-#ifdef LINXUART
-unsigned char RXstate = 0;
-unsigned short charCounter = 0;
-#endif
-
-unsigned char getDataByte(unsigned long dataInInteger) {
-    unsigned short i;
-    unsigned short intMask = 0b0010;
-    unsigned char byteMask = 0x01;
-    unsigned char dataByte;
-
-    dataByte = 0x00;
-    for (i = 0; i < NUM_DATA_BITS; i++) {
-        if (intMask & dataInInteger) dataByte = dataByte | byteMask;
-        intMask = intMask << 2;
-        byteMask = byteMask << 1;
-    }
-    return (~dataByte);
-}
-
-unsigned short getDataInteger(unsigned long dataInInteger) {
-    unsigned short i;
-    unsigned long longMask = 0b0010;
-    unsigned short shortMask = 0x01;
-    unsigned short dataInt;
-
-    dataInt = 0x0000;
-    for (i = 0; i < NUM_DATA_BITS; i++) {
-        if (longMask & dataInInteger) dataInt = dataInt | shortMask;
-        longMask = longMask << 2;
-        shortMask = shortMask << 1;
-    }
-    return (~dataInt);
-}
-
-#define XORmask 0xAAAAAAAA
-unsigned long getOutData(unsigned long dataOut) {
-    unsigned long dataInt, intMask, xorInt;
-    unsigned long i, dataMask;
-
-    dataInt = 0x0000;
-    dataMask = 0x0001;
-    intMask = 0x0003;
-    for (i = 0; i < NUM_DATA_BITS; i++) {
-        if (dataMask & dataOut) dataInt = dataInt | intMask;
-        dataMask = dataMask << 1;
-        intMask = intMask << 2;
-    }
-    xorInt = XORmask ^ dataInt;
-    return (xorInt);
-}
 
 int main(void) {
-    unsigned short RXdataIn;
     unsigned short dataOut = 0;
     unsigned short command = 0;
-    unsigned short check = 0;
-    unsigned short receiveCounter = 0;
-    short i;
+    unsigned short dataCounter = 0;
 
     InitializeSystem();
-    TRIG_OUT = 0;
+    TEST_OUT = 0;
 #ifdef TRANSMITTER    
     TX_OUT = 0;
 #endif    
@@ -184,24 +142,8 @@ int main(void) {
     dataOut = 0;
 #endif    
 
-#ifdef LINXUART
-    printf("\rTESTING LINX UART AT 9600 BAUD");
-#endif    
     dataOut = 0xFF00;
     while (1) {
-#ifdef LINXUART
-        if (LINXRxLength) {            
-            printf("\r#%d: %s", receiveCounter++, LINXRxBuffer);
-            LINXRxLength = 0;
-        }
-        /*
-        if (STARTflag) {
-            STARTflag = FALSE;
-            printf("\rSTART: %d, %d, %d, %d", arrTimer2[0], arrTimer2[1], arrTimer2[2], arrTimer2[3]);
-            printf("\rINTS: %d, %d, %d", INTcounter, OERRcounter, FERRcounter);
-        }        
-        */
-#endif
 #ifdef TRANSMITTER                
         if (!TXstate) {
             DelayMs(100);
@@ -214,17 +156,14 @@ int main(void) {
         }
 #endif        
 #ifdef RECEIVER
-        if (dataReady) {
+        if (dataReady) {   
+            dataCounter++;                 
+            printf("\r#%d DATA: %X,", dataCounter, RXdataIn);
             dataReady = FALSE;
-            // RXdataIn = (short) getDataByte(dataInInteger);
-            RXdataIn = getDataInteger(dataInInteger);
-            command = RXdataIn & 0xFF;
-            check = (RXdataIn & 0xFF00) >> 8;
-            if (check == command) printf("\r%X", command);
-            else printf("\rERROR: %x != %x", check, command);
-        } else if (error) {
+        }
+        if (error) {
             printf("\rError: %d", error);
-            error = 0;            
+            error = 0;
         }
 #endif        
 
@@ -268,7 +207,7 @@ static void InitializeSystem(void) {
 
     PORTSetPinsDigitalIn(IOPORT_B, BIT_0);
 
-    PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1);
+    PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1 | BIT_2);
 
 
     PORTSetPinsDigitalOut(IOPORT_C, BIT_3 | BIT_13 | BIT_14 | BIT_4);
@@ -282,20 +221,20 @@ static void InitializeSystem(void) {
     T2CONbits.TCKPS1 = 1;
     T2CONbits.TCKPS0 = 1;
     T2CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
-    PR2 = 100;    // Was 100
+    PR2 = 100;
     T2CONbits.TON = 1; // Let her rip
     // OpenTimer2(T2_ON | T2_SOURCE_INT | T2_PS_1_256, 5208); For 60 frames/sec 
 
     // set up the core timer interrupt with a priority of 5 and zero sub-priority
     ConfigIntTimer2(T2_INT_ON | T2_INT_PRIOR_5);
-    
-    
+
+
     // Set up Timer 3 as a counter
     T3CON = 0x00;
-    T3CONbits.TCS = 1;     // Use counter input    
+    T3CONbits.TCS = 1; // Use counter input    
     T3CONbits.TCKPS2 = 0; // 1:1 Prescaler
     T3CONbits.TCKPS1 = 0;
-    T3CONbits.TCKPS0 = 0;    
+    T3CONbits.TCKPS0 = 0;
     T3CONbits.TON = 1; // Let her rip    
 
     // Set up main UART
@@ -312,19 +251,6 @@ static void InitializeSystem(void) {
     INTEnable(INT_SOURCE_UART_RX(HOSTuart), INT_ENABLED);
     INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
     // INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);        
-
-#ifdef LINXUART      
-    // Set up LINX UART
-    UARTConfigure(LINXuart, UART_ENABLE_PINS_TX_RX_ONLY);
-    UARTSetLineControl(LINXuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    UARTSetDataRate(LINXuart, SYS_FREQ, 9600);
-    UARTEnable(LINXuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
-
-    INTEnable(INT_U1TX, INT_DISABLED);
-    INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);
-    INTSetVectorPriority(INT_VECTOR_UART(LINXuart), INT_PRIORITY_LEVEL_2);
-    // INTSetVectorSubPriority(INT_VECTOR_UART(LINXuart), INT_SUB_PRIORITY_LEVEL_0);            
-#endif
 
     // Turn on the interrupts
     INTEnableSystemMultiVectoredInt();
@@ -378,39 +304,6 @@ void __ISR(HOST_VECTOR, ipl2) IntHostUartHandler(void) {
                 INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
             }
         } else INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
-    }
-}
-
-void __ISR(LINX_VECTOR, ipl2) IntLinxUartHandler(void) {    
-unsigned char ch;
-    INTcounter++;
-    if (LINXbits.OERR || LINXbits.FERR) {
-        if (LINXbits.FERR) FERRcounter++;
-        if (LINXbits.OERR) OERRcounter++;
-        if (UARTReceivedDataIsAvailable(LINXuart))
-            ch = UARTGetDataByte(LINXuart);
-        LINXbits.OERR = 0;
-        LINXRxIndex = 0;        
-    } else if (INTGetFlag(INT_SOURCE_UART_RX(LINXuart))) {
-        INTClearFlag(INT_SOURCE_UART_RX(LINXuart));
-        if (UARTReceivedDataIsAvailable(LINXuart)) {
-            ch = UARTGetDataByte(LINXuart);
-            if (ch == '>') LINXRxIndex = 0;
-            if (LINXRxIndex < MAXBUFFER - 2 && isalpha(ch))
-                LINXRxBuffer[LINXRxIndex++] = ch;            
-            UARTtimeout = UART_TIMEOUT;            
-            if (ch == '<') {
-                LINXRxBuffer[LINXRxIndex++] = '\0';
-                LINXRxLength = LINXRxIndex;
-                LINXRxIndex = 0;
-                UARTtimeout = 0;
-                // INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);                
-            }                            
-        }
-    }
-
-    if (INTGetFlag(INT_SOURCE_UART_TX(LINXuart))) {
-        INTClearFlag(INT_SOURCE_UART_TX(LINXuart));
     }
 }
 
@@ -502,221 +395,149 @@ void __ISR(_ADC_VECTOR, ipl6) AdcHandler(void) {
 
 }
 
-#define ERROR_COUNTS 10
-#define BIT_ERROR_COUNTS 6
-#define START_ONE 300 // was 200
-#define START_TWO 60
-#define START_THREE 60 
-#define START_FOUR 90
-#define BITPERIOD 10
-#define TIMEOUT 30
-#define NUM_SETTLING_PULSES 3 
-
+#ifdef RECEIVER    
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
-    static unsigned short Timer2Counter = 0;    
-    static unsigned long dataOutMask = 0x0001;
+    static unsigned short Timer2Counter = 0;
+    static unsigned short dataOutMask = 0x0001;
     static unsigned int PreviousPINstate = 0;
-    static unsigned long dataInt = 0x0000;
-    static unsigned char pulseCounter = 0;
-    unsigned char ch;
-#ifdef TRANSMITTER    
-    static unsigned char bitCounter = 0;
-#endif
+    static unsigned short dataInt = 0x0000;
+    static unsigned char evenFlag = FALSE;
+    static unsigned short bitCounter = 0;
 
-    if (TEST_OUT) TEST_OUT = 0;
-    else TEST_OUT = 1;
-    
     mT2ClearIntFlag(); // clear the interrupt flag    
-
-#ifdef LINXUART    
-    if (UARTtimeout) {
-        UARTtimeout--;
-        if (!UARTtimeout) {
-            RXstate = 0;
-            LINXRxIndex = 0;
-            INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_DISABLED);
-        }
-    }    
+    
     Timer2Counter++;
     if (RX_IN != PreviousPINstate) {
         PreviousPINstate = RX_IN;
+        // START condition checked here
         if (RXstate == 0) {
             if (RX_IN == 1) {
                 RXstate++;
-                Timer2Counter = 0x00;
                 dataOutMask = 0x0001;
+                evenFlag = TRUE;
                 dataInt = 0x0000;
-            } 
+                bitCounter = 0;
+                error = 0;
+            }
         } else if (RXstate == 1) {
             if (RX_IN == 0) {
-                if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {
-                    RXstate++;
-                    arrTimer2[0] = Timer2Counter;
-                    Timer2Counter = 0x00;
-                } else RXstate = 0;
-            } else RXstate = 0;
-        } else if (RXstate == 2) {
-            if (RX_IN == 1) {
-                if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {                    
-                    RXstate++;
-                    arrTimer2[1] = Timer2Counter;
-                    Timer2Counter = 0x00;
-                } else RXstate = 0;
-            } else RXstate = 0;        
-        } else if (RXstate == 3) {
-            if (RX_IN == 0) {
-                if (Timer2Counter > (START_THREE - ERROR_COUNTS) && Timer2Counter < (START_THREE + ERROR_COUNTS)) {
-                    RXstate++;
-                    arrTimer2[2] = Timer2Counter;
-                    Timer2Counter = 0x00;
-                } else RXstate = 0;
-            } else RXstate = 0;                       
-        } else if (RXstate == 4) {
-            if (RX_IN == 1) {
-                if (Timer2Counter > (START_FOUR - ERROR_COUNTS) && Timer2Counter < (START_FOUR * 2)) {
-                    RXstate++;
-                    arrTimer2[3] = Timer2Counter;
-                    Timer2Counter = 0x00;
-                    STARTflag = TRUE;                    
-                    while (LINXbits.OERR || LINXbits.FERR) {
-                        if (LINXbits.FERR) FERRcounter++;
-                        if (LINXbits.OERR) OERRcounter++;
-                        if (UARTReceivedDataIsAvailable(LINXuart))
-                        ch = UARTGetDataByte(LINXuart);
-                        LINXbits.OERR = 0;
-                    }                                           
-                    INTEnable(INT_SOURCE_UART_RX(LINXuart), INT_ENABLED);
-                    UARTtimeout = UART_TIMEOUT;
-                } else RXstate = 0;
-            } else RXstate = 0;
-        }                 
-    }
-#endif
-
-#ifdef RECEIVER        
-    Timer2Counter++; 
-    if (RX_IN != PreviousPINstate) {        
-        PreviousPINstate = RX_IN;        
-        if (RXstate == 0) {                        
-            if (RX_IN == 1) {
-                RXstate++;
-                Timer2Counter = 0x00;
-                dataOutMask = 0x0001;
-                dataInt = 0x0000;                                
-            } 
-        } else if (RXstate == 1) {
-            if (RX_IN == 0) {
-                if (Timer2Counter > (START_ONE - ERROR_COUNTS) && Timer2Counter < (START_ONE + ERROR_COUNTS)) {                
-                    RXstate++;
-                    Timer2Counter = 0x00;
-                } else RXstate = 0;
+                if (Timer2Counter > START_ONE) RXstate++;
+                else RXstate = 0;
             }
         } else if (RXstate == 2) {
             if (RX_IN == 1) {
-                if (Timer2Counter > (START_TWO - ERROR_COUNTS) && Timer2Counter < (START_TWO + ERROR_COUNTS)) {                    
-                    RXstate++;
-                    Timer2Counter = 0x00;
-                } else RXstate = 0;
-            } else RXstate = 0;
-        } else if (RXstate == 3) {
-            if (RX_IN == 0) {
-                if (Timer2Counter > (START_THREE - ERROR_COUNTS) && Timer2Counter < (START_THREE + ERROR_COUNTS)) {
-                    RXstate++;
-                    Timer2Counter = 0x00;
-                    STARTflag = TRUE;
-                } else RXstate = 0;
-            } else RXstate = 0;
-        } else if (RXstate == 4) {
-            if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
-                Timer2Counter = 0x00;
-                if (RX_IN) RXstate++;
+                if (Timer2Counter > START_TWO) RXstate++;
                 else RXstate = 0;
             } else RXstate = 0;
-        } else {
-            // if (Timer2Counter > (BITPERIOD - BIT_ERROR_COUNTS) && Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
-            if (Timer2Counter < (BITPERIOD + BIT_ERROR_COUNTS)) {
-                Timer2Counter = 0x00;
+        } else if (RXstate == 3) {
+            if (RX_IN == 0) {
+                if (Timer2Counter > START_THREE) RXstate++;
+                else RXstate = 0;
+            } else RXstate = 0;
+        } else if (RXstate == 4)
+            RXstate++;
+        // If code makes it to here, then START condition is done
+        // and data may now be received:
+        else {
+            if (Timer2Counter > MAXBITLENGTH) {
+                if (!RX_IN) dataInt = dataInt | dataOutMask;
+                dataOutMask = dataOutMask << 1;
+                bitCounter++;
+                evenFlag = TRUE;
+            } else if (evenFlag) {
+                evenFlag = FALSE;
                 if (RX_IN) dataInt = dataInt | dataOutMask;
                 dataOutMask = dataOutMask << 1;
-            } else if (Timer2Counter < ((BITPERIOD + BIT_ERROR_COUNTS)*2)) {
-                Timer2Counter = 0x00;
-                if (RX_IN) {
-                    dataInt = dataInt | dataOutMask;
-                    dataOutMask = dataOutMask << 1;
-                    dataInt = dataInt | dataOutMask;
-                    dataOutMask = dataOutMask << 1;
-                } else dataOutMask = dataOutMask << 2;
-            } else RXstate = 0;
+                bitCounter++;
+            } else evenFlag = TRUE;
         }
-    } else if (Timer2Counter > TIMEOUT && RXstate == 5) {
-        dataReady = TRUE;
-        dataInInteger = dataInt;
-        RXstate = 0;
-    }            
+        if (bitCounter >= NUM_DATA_BITS) {
+            dataReady = TRUE;
+            RXdataIn = dataInt;
+            TEST_OUT = 0;
+            RXstate = 0;
+        }
+        Timer2Counter = 0;
+    }// end if (RX_IN != PreviousPINstate)
+    else if (RXstate && (Timer2Counter > TIMEOUT)) {
+        TEST_OUT = 0;
+        if (RXstate > 3) error = 1;
+        RXstate = 0;        
+    }
+} // end Timer2Handler(void)
 #endif    
 
-#ifdef TRANSMITTER     
-    if (Timer2Counter) Timer2Counter--;
-    if (!Timer2Counter) {
-        if (TXstate) {
-            if (TXstate == 1) {
-                if (TX_OUT) {
-                    TX_OUT = 0;
-                    pulseCounter++;
-                    if (pulseCounter >= NUM_SETTLING_PULSES) {
-                        pulseCounter = 0;
-                        TXstate++;
-                    }
-                } else TX_OUT = 1;
-                TRIG_OUT = 1;
-                Timer2Counter = BITPERIOD;
-            } else if (TXstate == 2) {
-                TX_OUT = 1;
-                Timer2Counter = START_ONE;
-                bitCounter = 0;
-                dataOutMask = 0x0001;
-                TXstate++;
-            } else if (TXstate == 3) {
+#ifdef TRANSMITTER   
+void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
+    static unsigned short Timer2Counter = 0;
+    static unsigned short dataOutMask = 0x0001;
+    static unsigned int PreviousPINstate = 0;
+    static unsigned short dataInt = 0x0000;
+    static unsigned char evenFlag = FALSE;
+    static unsigned short bitCounter = 0;
+
+    mT2ClearIntFlag(); // clear the interrupt flag  
+if (Timer2Counter) Timer2Counter--;
+if (!Timer2Counter) {
+    if (TXstate) {
+        if (TXstate == 1) {
+            if (TX_OUT) {
                 TX_OUT = 0;
-                Timer2Counter = START_TWO;
-                TXstate++;
-            } else if (TXstate == 4) {
-                TX_OUT = 1;
-                Timer2Counter = START_THREE;
-                TXstate++;
-            } else if (TXstate == 5) {
-                TX_OUT = 0;
-                Timer2Counter = BITPERIOD;
-                TXstate++;
-            } else if (TXstate == 6) {
-                TX_OUT = 1;
-                Timer2Counter = BITPERIOD;
-                TXstate++;
-            } else if (TXstate == 7) {
-                if (bitCounter < (NUM_DATA_BITS * 2)) {
-                    if (dataOutInt & dataOutMask) TX_OUT = 1;
-                    else TX_OUT = 0;
-                    dataOutMask = dataOutMask << 1;
-                    Timer2Counter = BITPERIOD;
-                } else {
-                    TX_OUT = 0;
+                pulseCounter++;
+                if (pulseCounter >= NUM_SETTLING_PULSES) {
+                    pulseCounter = 0;
                     TXstate++;
-                    Timer2Counter = TIMEOUT * 2;
                 }
-                bitCounter++;
-            } else if (TXstate == 8) {
-                TXstate = 0;
-                TX_OUT = 0;
-                TRIG_OUT = 0;
+            } else TX_OUT = 1;
+            TRIG_OUT = 1;
+            Timer2Counter = BITPERIOD;
+        } else if (TXstate == 2) {
+            TX_OUT = 1;
+            Timer2Counter = START_ONE;
+            bitCounter = 0;
+            dataOutMask = 0x0001;
+            TXstate++;
+        } else if (TXstate == 3) {
+            TX_OUT = 0;
+            Timer2Counter = START_TWO;
+            TXstate++;
+        } else if (TXstate == 4) {
+            TX_OUT = 1;
+            Timer2Counter = START_THREE;
+            TXstate++;
+        } else if (TXstate == 5) {
+            TX_OUT = 0;
+            Timer2Counter = BITPERIOD;
+            TXstate++;
+        } else if (TXstate == 6) {
+            TX_OUT = 1;
+            Timer2Counter = BITPERIOD;
+            TXstate++;
+        } else if (TXstate == 7) {
+            if (bitCounter < (NUM_DATA_BITS * 2)) {
+                if (dataOutInt & dataOutMask) TX_OUT = 1;
+                else TX_OUT = 0;
+                dataOutMask = dataOutMask << 1;
+                Timer2Counter = BITPERIOD;
             } else {
-                TXstate = 0;
                 TX_OUT = 0;
-                TRIG_OUT = 0;
+                TXstate++;
+                Timer2Counter = TIMEOUT * 2;
             }
+            bitCounter++;
+        } else if (TXstate == 8) {
+            TXstate = 0;
+            TX_OUT = 0;
+            TRIG_OUT = 0;
+        } else {
+            TXstate = 0;
+            TX_OUT = 0;
+            TRIG_OUT = 0;
         }
     }
-#endif       
 }
+#endif       
+
 
 
 /** EOF main.c *************************************************/
