@@ -11,6 +11,7 @@
  *  Transmit errors rarely occur. Distance improved significantly. 
  *  Switching PR2 register between 100 uS and 10 uS interrupts is working well.
  *  Added multibyte packets and CRC check. Works great!
+ * 11-28-16: Works with Linx 8 pushbutton transmitter.
  *********************************************************************************************/
 
 #include <plib.h>
@@ -20,22 +21,38 @@
 #define true TRUE
 #define false FALSE
 
+// #define TRANSMITTER
+// #define LINXPUSHBUTTONS   
+#define MAGICWAND
 
+#ifdef LINPUSHBUTTONS
 #define MAXBITLENGTH 20
-#define START_ONE 29
-#define START_TWO 4 // was 5
-#define START_THREE 4 // was 5
+#define START_ONE 50// 29
+#define START_TWO 100 // 4 
+#define START_THREE 50 // was 4
 #define TIMEOUT (MAXBITLENGTH * 3)
 #define NUM_SETTLING_PULSES 3 
+#endif
 
-// #define TRANSMITTER
-#define RECEIVER
+#ifdef MAGICWAND
+#define MAXBITLENGTH 20
+#define START_ONE 29
+#define START_TWO 4 
+#define START_THREE 4
+#define TIMEOUT (MAXBITLENGTH * 3)
+#define NUM_SETTLING_PULSES 3 
+#endif
+
+
+
 
 #define START_TRANSMIT 1
 
 #define TEST_OUT LATBbits.LATB1
 #define TRIG_OUT LATBbits.LATB15
-#define PULSE_OUT LATBbits.LATB2
+// #define PULSE_OUT LATBbits.LATB2
+#define TRIGGER_IN PORTReadBits(IOPORT_B, BIT_2)
+
 #define TRIG_BIT BIT_15
 #define NUM_DATA_BITS 8
 
@@ -73,6 +90,24 @@
 #define HOSTbits U2STAbits
 #define HOST_VECTOR _UART_2_VECTOR 
 
+#define MAXDATABITS 64
+
+#define NUMBUTTONS 8
+const unsigned short arrBitTimes[NUMBUTTONS][4] = 
+{{9, 74, 10, 9}, 
+{19, 62, 19, 41}, 
+{31, 51, 31, 9}, 
+{41, 41, 63, 66}, 
+{52, 30, 41, 19}, 
+{63, 19, 41, 9}, 
+{74, 8, 9, 9}, 
+{84, 20, 41, 8}};
+
+
+unsigned short arrBitTimer[MAXDATABITS];
+unsigned short dataByteCounter = 0;
+unsigned char dataReady = FALSE;
+
 #define MAXBUFFER 128
 unsigned char HOSTTxBuffer[MAXBUFFER];
 unsigned char HOSTRxBuffer[MAXBUFFER];
@@ -100,6 +135,7 @@ unsigned char getDataByte(unsigned long dataInInteger);
 static void InitializeSystem(void);
 void ProcessIO(void);
 void ConfigAd(void);
+unsigned char getLinxButton(unsigned short *ptrData);
 
 // #define FILENAME "CUES.txt"
 static const char FILENAME[] = "CUES.txt";
@@ -107,7 +143,7 @@ static const char FILENAME[] = "CUES.txt";
 unsigned char TXstate = 0;
 unsigned long dataOutInt = 0;
 #endif
-#ifdef RECEIVER
+#ifdef MAGICWAND
 unsigned char RXstate = 0;
 // unsigned char dataReady = FALSE;
 // unsigned short RXdataIn = 0x0000;
@@ -117,12 +153,54 @@ unsigned char RXstate = 0;
 unsigned char arrData[MAXDATABYTES];
 unsigned char numDataBytes = 0;
 
+void clearDataArray(unsigned short *ptrArray);
+
+void clearDataArray(unsigned short *ptrArray){
+unsigned short i;
+    for (i = 0; i < MAXDATABITS; i++) ptrArray[i] = 0;
+}
+
+  
+#define MAX_ALLOWABLE_ERROR 2
+unsigned char getLinxButton(unsigned short *ptrData){
+unsigned char i;   
+unsigned char buttonID = 0;
+unsigned short ref1, ref2, ref3, ref4, testVar1, testVar2, testVar3, testVar4, error1, error2, error3, error4;
+
+    for (i = 0; i < NUMBUTTONS; i++){
+        ref1 = arrBitTimes[i][0];
+        ref2 = arrBitTimes[i][1];
+        ref3 = arrBitTimes[i][2];
+        ref4 = arrBitTimes[i][3];
+        
+        testVar1 = ptrData[26];
+        testVar2 = ptrData[28];
+        testVar3 = ptrData[30];
+        testVar4 = ptrData[32];
+        
+        error1 = abs(testVar1 - ref1);
+        error2 = abs(testVar2 - ref2);
+        error3 = abs(testVar3 - ref3);
+        error4 = abs(testVar4 - ref4);
+        
+        if (error1 <= MAX_ALLOWABLE_ERROR 
+            && error2 <= MAX_ALLOWABLE_ERROR 
+            && error3 <= MAX_ALLOWABLE_ERROR 
+            && error4 <= MAX_ALLOWABLE_ERROR){
+            buttonID = i + 1;
+            break;
+        }
+    }
+    return(buttonID);
+}
+
 int main(void) {
     unsigned short dataOut = 0;
     unsigned short command = 0;
-    unsigned short dataCounter = 0;
+    unsigned short trialCounter = 0;
     unsigned short i;
-    unsigned short CRCcheck;
+    unsigned short CRCcheck;    
+    unsigned short buttonNumber = 0;
 
     union {
         unsigned char CRCbyte[2];
@@ -137,16 +215,17 @@ int main(void) {
 
     DelayMs(200);
 
-#ifdef RECEIVER
-    printf("\rTESTING CRC");
+#ifdef MAGICWAND
+    printf("\rTESTING MAGIC WAND COMMUNICATION...");
 #endif
 
-#ifdef TRANSMITTER
-    printf("\rTESTING TRANSMITTER");
+#ifdef LINXPUSHBUTTON
+    printf("\rTESTING LINX PUSHBUTTON TRANSMITTER");
     dataOut = 0;
 #endif    
 
-    dataOut = 0xFF00;
+    dataOut = 0xFF00;    
+    clearDataArray(arrBitTimer);
     while (1) {
 #ifdef TRANSMITTER                
         if (!TXstate) {
@@ -159,12 +238,28 @@ int main(void) {
             TXstate = START_TRANSMIT;
         }
 #endif        
-#ifdef RECEIVER
+   
+        
+#ifdef LINXPUSHBUTTON     
+        if (RXstate == 2){  
+            // printf("\r{%d, %d, %d, %d, %d}, ", trialCounter++, arrBitTimer[26], arrBitTimer[28], arrBitTimer[30], arrBitTimer[32]);
+            buttonNumber = getLinxButton(arrBitTimer);
+            clearDataArray(arrBitTimer); 
+            if (buttonNumber) printf ("\r#%d: Button number = %d", trialCounter, buttonNumber);
+            trialCounter++;
+            dataByteCounter = 0;
+            DelayMs(200);
+            DelayMs(200);
+            RXstate = 0;
+        }
+#endif        
+
+#ifdef MAGICWAND        
         if (numDataBytes) {
             if ((numDataBytes > MAXDATABYTES) || (numDataBytes < 4))
                 printf("\r\rERROR: Bytes received: %d", numDataBytes);
             else {                
-                printf("\r\r#%d Bytes received: %d DATA: ", ++dataCounter, numDataBytes);
+                printf("\r\r#%d Bytes received: %d DATA: ", ++trialCounter, numDataBytes);
                 for (i = 0; i < numDataBytes; i++) printf("%X, ", arrData[i]);                
                 CRCcheck = CRCcalculate(&arrData[1], numDataBytes-3);
                 convert.CRCbyte[0] = arrData[numDataBytes-2];
@@ -179,6 +274,7 @@ int main(void) {
             error = 0;
         }
 #endif        
+        
 
     }//end while
 }//end main
@@ -217,10 +313,15 @@ static void InitializeSystem(void) {
     PORTSetPinsDigitalOut(IOPORT_D, TX_PIN);
     TX_OUT = 1;
 #endif    
-
-    PORTSetPinsDigitalIn(IOPORT_B, BIT_0);
-
-    PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1 | BIT_2);
+    
+    PORTSetPinsDigitalIn(IOPORT_B, BIT_0 | BIT_2);    
+    /*
+    mCNOpen(CN_ON, CN4_ENABLE, CN4_PULLUP_ENABLE);
+    ConfigIntCN(CHANGE_INT_ON | CHANGE_INT_PRI_2);
+    */
+    
+    // PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1 | BIT_2);
+    PORTSetPinsDigitalOut(IOPORT_B, BIT_15 | BIT_1);    
 
 
     PORTSetPinsDigitalOut(IOPORT_C, BIT_3 | BIT_13 | BIT_14 | BIT_4);
@@ -234,8 +335,15 @@ static void InitializeSystem(void) {
     T2CONbits.TCKPS1 = 1;
     T2CONbits.TCKPS0 = 1;
     T2CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
+#ifdef MAGICWAND    
     PR2 = 1000;
-    T2CONbits.TON = 1; // Let her rip
+#endif
+#ifdef LINXPUSHBUTTONS
+    PR2 = 100;
+#endif    
+    
+    T2CONbits.TON = 1; // Let her rip    
+   
     // OpenTimer2(T2_ON | T2_SOURCE_INT | T2_PS_1_256, 5208); For 60 frames/sec 
 
     // set up the core timer interrupt with a priority of 5 and zero sub-priority
@@ -408,8 +516,74 @@ void __ISR(_ADC_VECTOR, ipl6) AdcHandler(void) {
 
 }
 
-#ifdef RECEIVER    
+   
 
+
+/******************************************************************************
+ *	Change Notice Interrupt Service Routine
+ *
+ *   Note: Switch debouncing is not performed.
+ *   Code comes here if SW2 (CN16) PORTD.RD7 is pressed or released.
+ *   The user must read the IOPORT to clear the IO pin change notice mismatch
+ *	condition first, then clear the change notice interrupt flag.
+ ******************************************************************************/
+
+/*
+void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
+    unsigned short triggerBit;
+
+    // Step #1 - always clear the mismatch condition first
+    triggerBit = PORTReadBits(IOPORT_B, BIT_2);
+
+    // Step #2 - then clear the interrupt flag
+    mCNClearIntFlag();
+    
+    if (triggerBit) {
+        TEST_OUT = 1;
+        ConfigIntCN(CHANGE_INT_OFF);
+        RXstate = 0;
+    }
+}
+*/
+
+#ifdef LINXPUSHBUTTON
+void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
+    static unsigned short Timer2Counter = 0;
+    static unsigned char byteMask = 0x0001;
+    static unsigned int PreviousPINstate = 0;
+    static unsigned char dataInt = 0x00;
+    static unsigned char evenFlag = FALSE;    
+    static unsigned char numExpectedBytes = 0;
+    static unsigned short dataIndex = 0;
+    
+    mT2ClearIntFlag(); // clear the interrupt flag        
+    Timer2Counter++;
+    
+    if (RX_IN != PreviousPINstate) {
+        PreviousPINstate = RX_IN;    
+        if (RXstate == 0) {
+            dataIndex = 0;
+            dataByteCounter = 0;
+        }
+        if ((Timer2Counter > 100) && (RX_IN == 1)){
+            if (RXstate == 0) RXstate = 1;
+            else if (RXstate == 1){
+                RXstate = 2;
+                dataByteCounter = dataIndex;
+            }
+        }
+        if (dataIndex == 5){
+            if (Timer2Counter < 80 || Timer2Counter > 88) RXstate = 0;
+        }
+        if (RXstate == 1){
+            if (dataIndex < MAXDATABITS) arrBitTimer[dataIndex++] = Timer2Counter;
+        }
+        Timer2Counter = 0;
+    }
+}
+#endif
+
+#ifdef MAGICWAND
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     static unsigned short Timer2Counter = 0;
     static unsigned char byteMask = 0x0001;
@@ -419,10 +593,12 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     static unsigned short dataIndex = 0;
     static unsigned char numExpectedBytes = 0;
 
-    mT2ClearIntFlag(); // clear the interrupt flag        
+    mT2ClearIntFlag(); // clear the interrupt flag      
+
     Timer2Counter++;
     if (RX_IN != PreviousPINstate) {
         PreviousPINstate = RX_IN;
+        
         // START condition checked here
         if (RXstate == 0) {
             PR2 = 1000;
@@ -493,6 +669,8 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     }
 } // end Timer2Handler(void)
 #endif    
+
+
 
 #ifdef TRANSMITTER   
 
