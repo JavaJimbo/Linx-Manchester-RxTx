@@ -32,8 +32,8 @@
 #include <string.h>
 #include <ctype.h>
 
-// #define MANCHESTER
-#define LINXFOB
+#define MANCHESTER
+// #define LINXFOB
 
 #ifdef LINXFOB
 #define RIGHT_PUSHBUTTON 0x332B
@@ -69,6 +69,7 @@
 
 #define UART_TIMEOUT 400
 
+// For UBW32 Board with 8 Mhz crystal, this should yield 80 Mhz system & peripheral clock
 #pragma config UPLLEN   = ON            // USB PLL Enabled
 #pragma config FPLLMUL  = MUL_20        // PLL Multiplier
 #pragma config UPLLIDIV = DIV_2         // USB PLL Input Divider
@@ -118,7 +119,7 @@ unsigned char RXstate = 0;
 #define MAXDATABYTES 64
 unsigned char arrData[MAXDATABYTES];
 
-unsigned short numBytesReceived = 0;
+
 unsigned char timeoutFlag = FALSE;
 
 #ifdef LINXFOB
@@ -126,12 +127,14 @@ unsigned char timeoutFlag = FALSE;
 unsigned short arrFobIntegers[NUM_FOB_INTEGERS];
 const char LinxHeader[6] = {0xCC, 0xD5, 0x55, 0x55, 0x55, 0x55};
 unsigned short dataInt = 0;
+unsigned short numBitsReceived = 0;
 #define MAXBITS 128
 unsigned short arrBits[MAXBITS];
 unsigned short arrBitTimer[MAXBITS];
 #endif
 
 #ifdef MANCHESTER
+unsigned short numBytesReceived = 0;
 
 int main(void) {
     unsigned short trialCounter = 0;
@@ -190,13 +193,13 @@ int main(void) {
     InitializeSystem();
     DelayMs(200);
     TEST_OUT = 0;
-
+    
     printf("\r\rTESTING LINX FOB COMMUNICATION");
     
     trialCounter = 0;
     while (1) {
         if (RXstate == 4) {
-            if (numBytesReceived >= MAXBITS) printf("\rOVERRUN ERROR");
+            if (numBitsReceived >= MAXBITS) printf("\rOVERRUN ERROR");
             else {
                 i = 0;
                 j = 0;
@@ -204,7 +207,7 @@ int main(void) {
                 dataInt = 0x0000;
                 mask = 0x0001;
                 //printf("\rINTEGERS: ");
-                while (i < numBytesReceived) {
+                while (i < numBitsReceived) {
                     if (arrBitTimer[i] > 0xC0) dataInt = dataInt | mask;
                     mask = mask << 1;
                     j++;
@@ -218,7 +221,7 @@ int main(void) {
                     i++;
                 }
                 pushKey = arrFobIntegers[3];
-                printf("\r#%d: ", trialCounter++);
+                printf("\r#%d %d bits received. KEY: ", trialCounter++, numBitsReceived);
                 if (pushKey == RIGHT_PUSHBUTTON) printf("RIGHT");
                 else if (pushKey == LEFT_PUSHBUTTON) printf("LEFT");
                 else if (pushKey == UP_PUSHBUTTON) printf("UP");
@@ -226,7 +229,8 @@ int main(void) {
                 else if (pushKey == CENTER_PUSHBUTTON) printf("CENTER");
                 else printf("INVALID KEY: %X", pushKey);
             }
-            numBytesReceived = 0;
+            DelayMs(50);
+            numBitsReceived = 0;
             RXstate = 0;
         } // end if (RXstate == 4)
     } // end while(1)
@@ -352,9 +356,11 @@ void __ISR(HOST_VECTOR, ipl2) IntHostUartHandler(void) {
     }
 }
 
+/*
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
     mT2ClearIntFlag(); // clear the interrupt flag    
 }
+*/
 
 void __ISR(_TIMER_4_VECTOR, ipl5) Timer4Handler(void) {
     mT4ClearIntFlag(); // clear the interrupt flag 
@@ -362,7 +368,7 @@ void __ISR(_TIMER_4_VECTOR, ipl5) Timer4Handler(void) {
 }
 
 #ifdef LINXFOB
-
+#define FOB_PACKET_BITS 81
 void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
     static unsigned short Timer2Counter = 0;
     static unsigned short i = 0, j = 0;
@@ -371,13 +377,11 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
     static unsigned int mask = 0, dataInt = 0;
 
     // Step #1 - always clear the mismatch condition first
-    // PORTDin = PORTDbits.RD14;
     PORTin = PORTBbits.RB0;
 
     // Step #2 - then clear the interrupt flag
     mCNClearIntFlag();
 
-    // Timer2Counter = TMR2 / 100;
     Timer2Counter = TMR2;
     TMR2 = 0x0000;
 
@@ -397,11 +401,17 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
             i = 0;
         } else RXstate = 0;
     } else if (RXstate == 2 || RXstate == 3) {
-        if (bitIndex < MAXBITS && Timer2Counter < START_ONE)
+        if (bitIndex < MAXBITS && Timer2Counter < START_ONE){
             arrBitTimer[bitIndex++] = Timer2Counter;
+            if (bitIndex == FOB_PACKET_BITS){
+                numBitsReceived = bitIndex;
+                RXstate = 4;
+                TEST_OUT = 0;                
+            }
+        }
         else {
             if (RXstate == 3) {
-                numBytesReceived = bitIndex;
+                numBitsReceived = bitIndex;
                 RXstate = 4;
                 TEST_OUT = 0;
             } else RXstate = 0;
@@ -424,7 +434,6 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
 #endif
 
 #ifdef MANCHESTER
-
 void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
     static unsigned short Timer2Counter = 0;
     static unsigned short byteMask = 0x0001;
@@ -532,199 +541,8 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
     } // End else
 }
 #endif
-/*
-void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
-    static unsigned short Timer2Counter = 0;
-    static unsigned short i = 0, j = 0;
-    unsigned short PORTin, RX_PIN;
-    static unsigned char dataIndex = 0, bitIndex = 0;
-    static unsigned int mask = 0, dataInt = 0;
-
-    // Step #1 - always clear the mismatch condition first
-    // PORTDin = PORTDbits.RD14;
-    PORTin = PORTBbits.RB0;
-
-    // Step #2 - then clear the interrupt flag
-    mCNClearIntFlag();
-
-    // Timer2Counter = TMR2 / 100;
-    Timer2Counter = TMR2;
-    TMR2 = 0x0000;
-
-    if (!PORTin) RX_PIN = 0;
-    else RX_PIN = 1;
-
-
-else if (RXstate == 2 || RXstate == 3) {
-    if (j < MAXBITS) arrBits[j++] = Timer2Counter;
-    else RXstate = 4;
-                
-        
-    if (Timer2Counter > 0x40) dataInt = dataInt | mask;
-    mask = mask << 1;
-    bitIndex++;
-    if (bitIndex >= 8) {
-        mask = 0x01;
-        bitIndex = 0;
-        if (dataIndex < MAXDATABYTES) arrData[dataIndex++] = dataInt;
-        dataInt = 0x00;             
-        if (dataIndex >= 6 && RXstate == 2) {
-            for (i = 0; i < 6; i++) {
-                if (arrData[i] != LinxHeader[i]) break;
-            }
-            if (i < 6) {
-                RXstate++;
-            }
-            else {
-                dataIndex = 0;
-                bitIndex = 0;
-                mask = 0x01;                    
-                RXstate++;
-            }
-        }
-        else if (dataIndex >= 4 && RXstate == 3) RXstate++;
-    } 
-} 
- */
-
-// if (Timer2Counter > START_ONE) RXstate = 0;
-/*
-if (RXstate > 1){
-    if (Timer2Counter > STOP){
-        RXstate = 4;
-        numBytesReceived = j;
-        j = 0;
-    } else if (j < MAXBITS) arrBits[j++] = Timer2Counter;
-}
- */
-
-
-
-/*
-void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
-    static unsigned short Timer2Counter = 0;
-    static unsigned short byteMask = 0x0001;
-    static unsigned short dataInt = 0x00;
-    static unsigned char oddFlag = FALSE;
-    static unsigned short dataIndex = 0;
-
-    unsigned short PORTin, RX_PIN;
-
-    // Step #1 - always clear the mismatch condition first
-    // PORTDin = PORTDbits.RD14;
-    PORTin = PORTBbits.RB0;
-
-    // Step #2 - then clear the interrupt flag
-    mCNClearIntFlag();
-
-    Timer2Counter = TMR2 / 100;
-    TMR2 = 0x0000;
-
-    if (!PORTin) RX_PIN = 0;
-    else RX_PIN = 1;
-
-    if (RXstate < 5) ConfigIntCN(CHANGE_INT_OFF | CHANGE_INT_PRI_2);
-    
-    if (RXstate && (Timer2Counter > TIMEOUT)) {
-        if (RXstate == 6) {
-            timeoutFlag = TRUE;
-            numBytesReceived = dataIndex;
-        }
-        RXstate = 0;
-    }
-    
-        // RX_IN goes HIGH when state machine is idle: first START
-    else if (RX_PIN && !RXstate)
-        RXstate = 1;
-
-    // RX_IN goes LOW after long pulse: second START
-    if (!RX_PIN && Timer2Counter > START_ONE && Timer2Counter < START_ONE * 2)
-        RXstate = 2;
-
-    // RX_IN goes HIGH: third START      
-    if (RX_PIN && RXstate == 2) {
-        if (Timer2Counter > START_TWO && Timer2Counter < START_TWO * 2)
-            RXstate++;
-        else RXstate = 0;
-        // RX_IN goes LOW: fourth START                 
-    } else if (RXstate == 3) {
-        if (Timer2Counter > START_THREE && Timer2Counter < START_THREE * 2)
-            RXstate++;
-        else RXstate = 0;
-        // RX_IN goes HIGH: dummy bit even pulse
-    } else if (RXstate == 4) {
-        if (Timer2Counter > START_FOUR && Timer2Counter < START_FOUR * 2) RXstate++;
-        else RXstate = 0;
-        // RX_IN goes LOW: dummy bit odd pulse                  
-    } else if (RXstate == 5) {
-        byteMask = 0x01;
-        oddFlag = FALSE;
-        dataInt = 0x00;
-        error = 0;
-        dataIndex = 0;        
-        TEST_OUT = 1;
-        RXstate++;
-        // RX STATE = 6:
-        // DATA BITS get processed here. 
-        // Clock state toggles between EVEN and ODD with each transition.
-        // First clock state is EVEN, followed by odd.
-        // One clock cycle per data bit.
-        // Data bit is always read on ODD half of clock cycle, when oddFlag = TRUE.
-        // A LONG pulse occurs whenever previous bit is different from new bit.
-        // So every 0-1 or 1-0 transition gets a long pulse.
-        // All LONG pulses begin and end when clock is ODD,
-        // so data bit is always read when long pulse is detected.
-    } else if (RXstate == 6) {
-        // If this a long pulse, data bit always gets read,
-        // since all long pulses end on odd clock cycle:
-        if (Timer2Counter > MAXBITLENGTH) {
-            if (RX_PIN) dataInt = dataInt | byteMask;
-            if (byteMask == 0x80) {
-                byteMask = 0x01;
-                if (dataIndex == 0) {
-                    numExpectedBytes = dataInt + 3;
-                }
-                if (dataIndex < MAXDATABYTES) arrData[dataIndex++] = (unsigned char) dataInt;                
-                dataInt = 0x00;
-            } else byteMask = byteMask << 1;
-            oddFlag = FALSE;
-
-            // Otherwise, this must be a short pulse,
-            // in which case 
-        } else if (oddFlag) {
-            oddFlag = FALSE;
-            if (RX_PIN) dataInt = dataInt | byteMask;
-            if (byteMask == 0x80) {
-                byteMask = 0x01;
-                if (dataIndex == 0) {
-                    numExpectedBytes = dataInt + 3;
-                }
-                if (dataIndex < MAXDATABYTES) arrData[dataIndex++] = (unsigned char) dataInt;                
-                dataInt = 0x00;
-            } else byteMask = byteMask << 1;
-        } else oddFlag = TRUE;
-
-        if (dataIndex >= numExpectedBytes && numExpectedBytes != 0) {
-            numBytesReceived = dataIndex;
-            dataIndex = 0;
-            RXstate = 0;
-            TEST_OUT = 0;
-        }
-    } // End else
-
-}
- */
 /** EOF main.c *************************************************/
 
-/*
-const char LinxHeader[48]={
-1,1,0,0,1,1,0,0, // 0xCC
-1,1,0,1,0,1,0,1, // 0xD5
-0,1,0,1,0,1,0,1, // 0x55
-0,1,0,1,0,1,0,1, // 0x55
-0,1,0,1,0,1,0,1, // 0x55
-0,1,0,1,0,1,0,1};// 0x55
- */
 
 
 
