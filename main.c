@@ -26,8 +26,10 @@
  * 12-7-16: Additional optimization. Uses interrupt on change.
  *      Can handle up to 64 bytes: length + data + CRC
  * 12-8-16; Implemented Linx communication for five button fob.
+ * 12-10-16: Modified RX pin handler so TMR4 = 0x0000
+ * 12-12-16: Check flags on incoming data from motion register 0x16
+ * 
  * *********************************************************************************************/
-
 #include <plib.h>
 #include <string.h>
 #include <ctype.h>
@@ -141,32 +143,58 @@ int main(void) {
     unsigned short i, j, k;
     unsigned short mask;
     unsigned short dataInt, pushKey;
-
     unsigned short CRCcheck;
+    short rawVectx, rawVecty, rawVectz;
+    unsigned char motionData = 0;
 
     union {
-        unsigned char CRCbyte[2];
-        unsigned short CRCinteger;
+        unsigned char byte[2];
+        unsigned short integer;
     } convert;
 
     InitializeSystem();
     DelayMs(200);
     TEST_OUT = 0;
 
-    printf("\rTESTING MANCHESTER CODE...");
+    printf("\rTESTING ACCELEROMETER...");
 
     while (1) {
         if (numBytesReceived) {
             CRCcheck = CRCcalculate(&arrData[1], numBytesReceived - 3);
-            convert.CRCbyte[0] = arrData[numBytesReceived - 2];
-            convert.CRCbyte[1] = arrData[numBytesReceived - 1];
+            convert.byte[0] = arrData[numBytesReceived - 2];
+            convert.byte[1] = arrData[numBytesReceived - 1];
 
-            printf("\r\r#%d: %d bytes received:", ++trialCounter, numBytesReceived);
-            for (i = 0; i < numBytesReceived; i++) {
-                if ((i % 8) == 0) printf("\r%X, ", arrData[i]);
-                else printf("%X, ", arrData[i]);
-            }
-            if (convert.CRCinteger != CRCcheck) printf("\r\rCRC ERROR: %d != %d", convert.CRCinteger, CRCcheck);
+            // printf("\r\r#%d: %d bytes received:", ++trialCounter, numBytesReceived);
+            if (convert.integer != CRCcheck) printf("\r\rCRC ERROR: %X != %X", convert.integer, CRCcheck);
+                        
+            motionData = arrData[1];
+            
+            convert.byte[0] = arrData[2];
+            convert.byte[1] = arrData[3];
+            rawVectx = (short) convert.integer / 4;
+            
+            convert.byte[0] = arrData[4];
+            convert.byte[1] = arrData[5];
+            rawVectz = (short) convert.integer / 4;
+            
+            convert.byte[0] = arrData[6];
+            convert.byte[1] = arrData[7];
+            rawVecty = (short) convert.integer / 4;
+            
+            printf ("\r\r%d: X: %d, Y: %d, Z: %d", ++trialCounter, (short) motionData, rawVectx, rawVecty, rawVectz);
+            printf ("\r");
+            if (0b00000010 & motionData){
+                if (0b00000001 & motionData) printf("-X, ");
+                else printf ("+X, ");
+            } 
+            if (0b00001000 & motionData){
+                if (0b00000100 & motionData) printf("-Y, ");
+                else printf ("+Y, ");
+            }       
+            if (0b00100000 & motionData){
+                if (0b00010000 & motionData) printf("-Z ");
+                else printf ("+Z ");
+            }                         
             if (timeoutFlag) {
                 printf("\rTIMEOUT");
                 timeoutFlag = FALSE;
@@ -440,9 +468,10 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
     static unsigned short dataInt = 0x00;
     static unsigned char oddFlag = FALSE;
     static unsigned short dataIndex = 0;
-
     unsigned short PORTin, RX_PIN;
 
+    TEST_OUT = 1;
+    
     // Step #1 - always clear the mismatch condition first
     // PORTDin = PORTDbits.RD14;
     PORTin = PORTBbits.RB0;
@@ -452,6 +481,7 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
 
     Timer2Counter = TMR2 / 100;
     TMR2 = 0x0000;
+    TMR4 = 0x0000;
 
     if (!PORTin) RX_PIN = 0;
     else RX_PIN = 1;
@@ -492,8 +522,7 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
         oddFlag = FALSE;
         dataInt = 0x00;
         error = 0;
-        dataIndex = 0;
-        TEST_OUT = 1;
+        dataIndex = 0;        
         RXstate++;
         // RX STATE = 6:
         // DATA BITS get processed here. 
@@ -535,10 +564,11 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
         if (dataIndex >= numExpectedBytes && numExpectedBytes != 0) {
             numBytesReceived = dataIndex;
             dataIndex = 0;
-            RXstate = 0;
-            TEST_OUT = 0;
-        }
-    } // End else
+            RXstate = 0;            
+        }   
+    } // End else    
+
+    TEST_OUT = 0;
 }
 #endif
 /** EOF main.c *************************************************/
