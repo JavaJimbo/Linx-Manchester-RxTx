@@ -31,7 +31,11 @@
  * 12-12-16: Check flags on incoming data from motion register 0x16
  * 09-08-16: recompiled. Works well with ManchesterTx Wand transmitting accelerometer data and two byte CRC
  *          Also Checked LINXFOB and copied to mainLinxFob.c
- *          
+ *  7-15-20: Modified to work for 4800 baud Sparkfun transmitter & receiver.
+ *           USES POLLING, not interrupts
+ * 
+ *  7-26-20: Works with Manchester Tx using Sparkfun transmitter and receiver.
+ *          Cleaned up, removed accelerometer, added repeats and 100 ms delay. 
  **********************************************************************************************************/
 #include <plib.h>
 #include <string.h>
@@ -42,13 +46,13 @@
 #define true TRUE
 #define false FALSE
 
-#define MAXBITLENGTH 20
+#define MAXBITLENGTH 5000 // 40
 #define START_ONE 80
 #define STOP 3000
 #define START_TWO 80
 #define START_THREE 40
 #define START_FOUR 40
-#define TIMEOUT 200
+#define TIMEOUT 1000
 
 #define TEST_OUT LATBbits.LATB1
 #define TRIG_OUT LATBbits.LATB15
@@ -82,18 +86,14 @@
 #define HOSTbits U2STAbits
 #define HOST_VECTOR _UART_2_VECTOR 
 
-unsigned char dataReady = FALSE;
-unsigned short previousExpected = 0, numExpectedBytes = 0;
-
 #define MAXBUFFER 128
 unsigned char HOSTTxBuffer[MAXBUFFER];
 unsigned char HOSTRxBuffer[MAXBUFFER];
 unsigned short HOSTTxLength;
 unsigned short HOSTRxLength = 0;
 
-#define MAXPOTS 4
-unsigned char arrPots[MAXPOTS];
-unsigned char error = 0;
+unsigned char TimeoutFlag = false;
+
 
 /** P R I V A T E  P R O T O T Y P E S ***************************************/
 extern unsigned short CRCcalculate(unsigned char *message, unsigned char nBytes);
@@ -111,75 +111,130 @@ unsigned char arrData[MAXDATABYTES];
 
 unsigned char timeoutFlag = FALSE;
 unsigned short numBytesReceived = 0;
+#define MAXBITS 256
+long arrBitData[MAXBITS];
 
-int main(void) {
+
+short numBitsReceived = 0;
+short RxTimeout = 0;
+
+
     unsigned short trialCounter = 0;
-    unsigned short i, j, k;
-    unsigned short mask;
-    unsigned short dataInt, pushKey;
+    unsigned short dataInt;
     unsigned short CRCcheck;
     short rawVectx, rawVecty, rawVectz;
-    unsigned char motionData = 0;
+    unsigned char motionData = 0;    
+    long Timer2Counter = 0;
+    short numExpectedBytes = 0;    
+    unsigned short byteMask = 0x0001;
+    unsigned char oddFlag = FALSE;
+    unsigned short dataIndex = 0;
+    unsigned short PreviousPORTBread, PORTBin;
+    short shortPulseCounter = 0;
+    short state = 0, previousState = 0;
+#define NUMBER_OF_BITS 16
+    long bitData[NUMBER_OF_BITS];
+    long FirstPulseCounts = 0;
+    long SecondPulseCounts = 0;
+    long ThirdPulseCounts = 0;
+    short bitIndex = 0, i = 0;
+    short timeoutCounter = 0;
+    short OKcounter = 0;
 
+int main(void) 
+{
+    
     union {
         unsigned char byte[2];
         unsigned short integer;
-    } convert;
+    } convert;    
 
     InitializeSystem();
     DelayMs(200);
     TEST_OUT = 0;
+    
+    printf("\r\r#1 Manchester RX with interrupts");    
 
-    printf("\rTESTING MAGIC WAND RECEIVER");
+    numBytesReceived = 0;
+    
+    for (i = 0; i < NUMBER_OF_BITS; i++) bitData[i] = 0;
+    bitIndex = 0;
 
-    while (1) {
-        if (numBytesReceived) {
+    while(1)
+    {             
+        /*
+        if (previousState != state && state > 1) 
+        {
+            if (state == 0) printf("\rS%d", state);
+            else printf(" S%d", state);
+        }
+        previousState = state;
+        */
+        
+        if (TimeoutFlag)
+        {
+            TimeoutFlag = false;
+            printf("\rTO");
+        }
+        if (numBytesReceived) 
+        {
+            state = 0;            
             CRCcheck = CRCcalculate(&arrData[1], numBytesReceived - 3);
             convert.byte[0] = arrData[numBytesReceived - 2];
             convert.byte[1] = arrData[numBytesReceived - 1];
 
-            // printf("\r\r#%d: %d bytes received:", ++trialCounter, numBytesReceived);
-            if (convert.integer != CRCcheck) printf("\r\rCRC ERROR: %X != %X", convert.integer, CRCcheck);
-                        
-            motionData = arrData[1];
-            
-            convert.byte[0] = arrData[2];
-            convert.byte[1] = arrData[3];
-            rawVectx = (short) convert.integer / 4;
-            
-            convert.byte[0] = arrData[4];
-            convert.byte[1] = arrData[5];
-            rawVectz = (short) convert.integer / 4;
-            
-            convert.byte[0] = arrData[6];
-            convert.byte[1] = arrData[7];
-            rawVecty = (short) convert.integer / 4;
-            
-            printf ("\r\r%d: X: %d, Y: %d, Z: %d", ++trialCounter, (short) motionData, rawVectx, rawVecty, rawVectz);
-            printf ("\r");
-            if (0b00000010 & motionData){
-                if (0b00000001 & motionData) printf("-X, ");
-                else printf ("+X, ");
-            } 
-            if (0b00001000 & motionData){
-                if (0b00000100 & motionData) printf("-Y, ");
-                else printf ("+Y, ");
-            }       
-            if (0b00100000 & motionData){
-                if (0b00010000 & motionData) printf("-Z ");
-                else printf ("+Z ");
-            }                         
-            if (timeoutFlag) {
-                printf("\rTIMEOUT");
-                timeoutFlag = FALSE;
-            }
+            // printf("\r#%d: %d bytes received: ", ++trialCounter, numBytesReceived);
             numBytesReceived = 0;
+            
+            if (convert.integer != CRCcheck) 
+                printf(" CRC ERROR: %X != %X, ", convert.integer, CRCcheck);
+            else
+            {        
+                motionData = arrData[1];
+                printf("\r#%d: %d, ", OKcounter++, motionData);
+            
+                convert.byte[0] = arrData[2];
+                convert.byte[1] = arrData[3];
+                rawVectx = (short) convert.integer;
+            
+                convert.byte[0] = arrData[4];
+                convert.byte[1] = arrData[5];
+                rawVectz = (short) convert.integer;
+            
+                convert.byte[0] = arrData[6];
+                convert.byte[1] = arrData[7];
+                rawVecty = (short) convert.integer;            
+                                
+                printf ("X: %d, Y: %d, Z: %d, ", rawVectx, rawVecty, rawVectz);
+                if (0b00000010 & motionData){
+                    if (0b00000001 & motionData) printf("-X, ");
+                    else printf ("+X, ");
+                } 
+                if (0b00001000 & motionData){
+                    if (0b00000100 & motionData) printf("-Y, ");
+                    else printf ("+Y, ");
+                }       
+                if (0b00100000 & motionData){
+                    if (0b00010000 & motionData) printf("-Z ");
+                    else printf ("+Z ");
+                }                                         
+                
+            }     
+            
+            // printf ("\r1st: %ld, 2nd: %ld, 3rd: %ld", FirstPulseCounts, SecondPulseCounts, ThirdPulseCounts);
+            /*
+            for (i = 0; i < NUMBER_OF_BITS; i++)
+            {
+                if ((i % 8)==0) printf("\r%d ", bitData[i]);
+                else printf("%ld ", bitData[i]);
+                bitData[i] = 0;
+            }
+            */
+            
         }
-        if (error) {
-            printf("\rError: %X", error);
-            error = 0;
-        }
-    }//end while
+        
+    }
+
 }//end main
 
 
@@ -190,7 +245,7 @@ static void InitializeSystem(void) {
     // Turn off JTAG so we get the pins back
     mJTAGPortEnable(false);
 
-    PORTSetPinsDigitalIn(IOPORT_B, BIT_0);
+    PORTSetPinsDigitalIn(IOPORT_B, BIT_0 | BIT_5);
     mCNOpen(CN_ON, CN2_ENABLE, CN2_PULLUP_ENABLE);
     ConfigIntCN(CHANGE_INT_ON | CHANGE_INT_PRI_2);
     
@@ -204,17 +259,18 @@ static void InitializeSystem(void) {
     T2CONbits.TCKPS2 = 0; // 1:8 Prescaler
     T2CONbits.TCKPS1 = 1;
     T2CONbits.TCKPS0 = 1;
-    T2CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
+    T2CONbits.T32 = 1; // Timers 2 & 3 are 32 bit timers
     PR2 = 0xFFFF;
+    PR3 = 0xFFFF;
     T2CONbits.TON = 1; // Let her rip      
 
-    // Set up Timer 4 for 10 Khz (100 uS) interrupts
+    // Set up Timer 4 for 100 Hz interrupts
     T4CON = 0x00;
-    T4CONbits.TCKPS2 = 0; // 1:8 Prescaler    
-    T4CONbits.TCKPS1 = 1;
-    T4CONbits.TCKPS0 = 1;
+    T4CONbits.TCKPS2 = 1; // 1:16 Prescaler    
+    T4CONbits.TCKPS1 = 0;
+    T4CONbits.TCKPS0 = 0;
     T4CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
-    PR4 = 1000;
+    PR4 = 50000;
     // set up the core timer interrupt with a priority of 5 and zero sub-priority
     ConfigIntTimer4(T4_INT_ON | T4_INT_PRIOR_5);
     T4CONbits.TON = 1; // Let her rip   
@@ -225,7 +281,7 @@ static void InitializeSystem(void) {
     UARTSetLineControl(HOSTuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
 #define HOSTuart UART2
 #define SYS_FREQ 80000000
-    UARTSetDataRate(HOSTuart, SYS_FREQ, 57600);
+    UARTSetDataRate(HOSTuart, SYS_FREQ, 115200);
     UARTEnable(HOSTuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
 
     // Configure UART #2 Interrupts
@@ -289,123 +345,154 @@ void __ISR(HOST_VECTOR, ipl2) IntHostUartHandler(void) {
     }
 }
 
-/*
-void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) {
-    mT2ClearIntFlag(); // clear the interrupt flag    
-}
-*/
+
+
+
+
 void __ISR(_TIMER_4_VECTOR, ipl5) Timer4Handler(void) {
     mT4ClearIntFlag(); // clear the interrupt flag 
-    ConfigIntCN(CHANGE_INT_ON | CHANGE_INT_PRI_2);
-}
-void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) {
-    static unsigned short Timer2Counter = 0;
-    static unsigned short byteMask = 0x0001;
-    static unsigned short dataInt = 0x00;
-    static unsigned char oddFlag = FALSE;
-    static unsigned short dataIndex = 0;
-    unsigned short PORTin, RX_PIN;
-
-    TEST_OUT = 1;
     
+    if (RxTimeout) 
+    {        
+        if (RxTimeout)
+        {
+            RxTimeout--;
+            if (!RxTimeout) TimeoutFlag = true;
+        }
+    }
+}
+
+void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void) 
+{
     // Step #1 - always clear the mismatch condition first
-    // PORTDin = PORTDbits.RD14;
-    PORTin = PORTBbits.RB0;
+    PORTBin = PORTRead(IOPORT_B) & 0x0001;
 
     // Step #2 - then clear the interrupt flag
     mCNClearIntFlag();
 
-    Timer2Counter = TMR2 / 100;
-    TMR2 = 0x0000;
-    TMR4 = 0x0000;
-
-    if (!PORTin) RX_PIN = 0;
-    else RX_PIN = 1;
-
-    if (RXstate < 5) ConfigIntCN(CHANGE_INT_OFF | CHANGE_INT_PRI_2);
-
-    if (RXstate && (Timer2Counter > TIMEOUT)) {
-        if (RXstate == 6) {
-            timeoutFlag = TRUE;
-            numBytesReceived = dataIndex;
+        if (PreviousPORTBread != PORTBin)
+        {
+            PreviousPORTBread = PORTBin;
+            Timer2Counter = (long) TMR2;  
+            TMR2 = 0x0000;
+                        
+            if (TimeoutFlag) 
+            {
+                TimeoutFlag = false;
+                state = 0;                    
+                shortPulseCounter = 0;
+                printf("\rTIMEOUT: %d", timeoutCounter++);
+            }          
+            
+            if (state && Timer2Counter > 70000)
+            {
+                RXstate = 0;                
+                // shortPulseCounter = 0;
+            }     
+            else if (!state)
+            {
+                //if (Timer2Counter > 4500 && Timer2Counter < 7500)
+                //    shortPulseCounter++;
+                //else shortPulseCounter = 0;
+                //bitData[bitIndex++] = Timer2Counter;
+                //if (bitIndex >= NUMBER_OF_BITS) bitIndex = 0;
+                //if (shortPulseCounter > 4) 
+                //{
+                //    state = 1;
+                //    shortPulseCounter = 0;
+                RxTimeout = 100;   
+                //}
+                if (PORTBin) state = 1;
+                
+            }
+            else if (state == 1)
+            {
+                if (Timer2Counter > 62000 && Timer2Counter < 63000)  
+                {
+                    state = 2;      
+                    FirstPulseCounts = Timer2Counter;
+                }    
+                else state = 0;
+            }
+            else if (state == 2)
+            {
+                if (Timer2Counter > 10000 && Timer2Counter < 20000) 
+                {
+                    state = 3;
+                    SecondPulseCounts = Timer2Counter;
+                }
+                else
+                {
+                    state = 0;
+                    shortPulseCounter = 0;
+                }
+            }
+            else if (state == 3)
+            {
+                if (Timer2Counter > 8000 && Timer2Counter < 10000)
+                {
+                    state = 4;
+                    ThirdPulseCounts = Timer2Counter;
+                    oddFlag = FALSE;
+                    dataInt = 0x00;
+                    dataIndex = 0;                        
+                    byteMask = 0x01;
+                    numExpectedBytes = 0;
+                    shortPulseCounter = 0;
+                    bitIndex = 0;                                                                
+                }
+            }
+            else if (state == 4 || state == 5 || state == 6)
+                state++;
+                
+            if (state == 7)
+            {                    
+                // If this a long pulse, data bit always gets read,
+                // since all long pulses end on odd clock cycle:
+                if (Timer2Counter > MAXBITLENGTH) 
+                {
+                    if (PORTBin) dataInt = dataInt | byteMask;
+                    if (byteMask == 0x80) 
+                    {
+                        byteMask = 0x01;
+                        if (dataIndex == 0) 
+                            numExpectedBytes = dataInt + 3;
+                        if (dataIndex < MAXDATABYTES) 
+                            arrData[dataIndex++] = (unsigned char) dataInt;
+                            dataInt = 0x00;
+                    } 
+                    else byteMask = byteMask << 1;
+                    oddFlag = FALSE;
+                } 
+                // Otherwise, this must be a short pulse,
+                // in which case data bits are read on odd pulses,
+                // and even pulses are ignored:
+                else if (oddFlag) 
+                {
+                    oddFlag = FALSE;
+                    if (PORTBin) dataInt = dataInt | byteMask;
+                    if (byteMask == 0x80) 
+                    {
+                        byteMask = 0x01;
+                        if (dataIndex == 0) 
+                            numExpectedBytes = dataInt + 3;
+                        if (dataIndex < MAXDATABYTES) 
+                            arrData[dataIndex++] = (unsigned char) dataInt;                        
+                        dataInt = 0x00;
+                    } else byteMask = byteMask << 1;
+                } 
+                else oddFlag = TRUE;                   
+                if (numExpectedBytes && dataIndex >= numExpectedBytes) // TODO: Make this more robust?                    
+                {
+                    numBytesReceived = dataIndex;
+                    state++;
+                }
+            }
         }
-        RXstate = 0;
-    }// RX_IN goes HIGH when state machine is idle: first START
-    else if (RX_PIN && !RXstate)
-        RXstate = 1;
-
-    // RX_IN goes LOW after long pulse: second START
-    if (!RX_PIN && Timer2Counter > START_ONE && Timer2Counter < START_ONE * 2)
-        RXstate = 2;
-
-    // RX_IN goes HIGH: third START      
-    if (RX_PIN && RXstate == 2) {
-        if (Timer2Counter > START_TWO && Timer2Counter < START_TWO * 2)
-            RXstate++;
-        else RXstate = 0;
-        // RX_IN goes LOW: fourth START                 
-    } else if (RXstate == 3) {
-        if (Timer2Counter > START_THREE && Timer2Counter < START_THREE * 2)
-            RXstate++;
-        else RXstate = 0;
-        // RX_IN goes HIGH: dummy bit even pulse
-    } else if (RXstate == 4) {
-        if (Timer2Counter > START_FOUR && Timer2Counter < START_FOUR * 2) RXstate++;
-        else RXstate = 0;
-        // RX_IN goes LOW: dummy bit odd pulse                  
-    } else if (RXstate == 5) {
-        byteMask = 0x01;
-        oddFlag = FALSE;
-        dataInt = 0x00;
-        error = 0;
-        dataIndex = 0;        
-        RXstate++;
-        // RX STATE = 6:
-        // DATA BITS get processed here. 
-        // Clock state toggles between EVEN and ODD with each transition.
-        // Data bit is always read on ODD half of clock cycle, 
-        // indicated when oddFlag = TRUE.
-        // All LONG pulses begin and end when clock is ODD,
-        // so data bit is always read when long pulse is detected.
-    } else if (RXstate == 6) {
-        // If this a long pulse, data bit always gets read,
-        // since all long pulses end on odd clock cycle:
-        if (Timer2Counter > MAXBITLENGTH) {
-            if (RX_PIN) dataInt = dataInt | byteMask;
-            if (byteMask == 0x80) {
-                byteMask = 0x01;
-                if (dataIndex == 0) {
-                    numExpectedBytes = dataInt + 3;
-                }
-                if (dataIndex < MAXDATABYTES) arrData[dataIndex++] = (unsigned char) dataInt;
-                dataInt = 0x00;
-            } else byteMask = byteMask << 1;
-            oddFlag = FALSE;
-
-            // Otherwise, this must be a short pulse,
-            // in which case 
-        } else if (oddFlag) {
-            oddFlag = FALSE;
-            if (RX_PIN) dataInt = dataInt | byteMask;
-            if (byteMask == 0x80) {
-                byteMask = 0x01;
-                if (dataIndex == 0) {
-                    numExpectedBytes = dataInt + 3;
-                }
-                if (dataIndex < MAXDATABYTES) arrData[dataIndex++] = (unsigned char) dataInt;
-                dataInt = 0x00;
-            } else byteMask = byteMask << 1;
-        } else oddFlag = TRUE;
-
-        if (dataIndex >= numExpectedBytes && numExpectedBytes != 0) {
-            numBytesReceived = dataIndex;
-            dataIndex = 0;
-            RXstate = 0;            
-        }   
-    } // End else    
-
-    TEST_OUT = 0;
+    
 }
+
+
 /** EOF main.c *************************************************/
 
 
